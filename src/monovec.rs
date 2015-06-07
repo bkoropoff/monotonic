@@ -13,6 +13,8 @@ use std::intrinsics;
 
 // A chunk in the vector
 struct Chunk<T> {
+    // Previous chunk
+    prev: *mut Chunk<T>,
     // Next chunk
     next: *mut Chunk<T>,
     // Count of items
@@ -24,7 +26,7 @@ struct Chunk<T> {
 }
 
 pub struct MonoVec<T> {
-    head: *mut Chunk<T>,
+    head: Cell<*mut Chunk<T>>,
     tail: Cell<*mut Chunk<T>>,
     _ph: PhantomData<T>
 }
@@ -44,6 +46,7 @@ impl<T> Chunk<T> {
         unsafe {
             let res = heap::allocate(Self::mem_size(cap),
                                      mem::align_of::<Self>()) as *mut Self;
+            ptr::write(&mut (*res).prev, ptr::null_mut());
             ptr::write(&mut (*res).next, ptr::null_mut());
             ptr::write(&mut (*res).len, 0);
             ptr::write(&mut (*res).cap, cap);
@@ -58,9 +61,9 @@ impl<T> MonoVec<T> {
     }
     
     pub fn with_capacity(cap: usize) -> Self {
-        let head = Chunk::new(cap);
+        let head = Chunk::new(cmp::max(cap, 1));
         MonoVec {
-            head: head,
+            head: Cell::new(head),
             tail: Cell::new(head),
             _ph: PhantomData
         }
@@ -69,7 +72,7 @@ impl<T> MonoVec<T> {
     // FIXME: track total len in header to make this O(1)?
     pub fn len(&self) -> usize {
         let mut len = 0;
-        let mut cur = self.head;
+        let mut cur = self.head.get();
 
         while !cur.is_null() {
             unsafe {
@@ -95,6 +98,7 @@ impl<T> MonoVec<T> {
                 }
                 let new = Chunk::new(new_cap);
                 
+                (*new).prev = tail;
                 (*tail).next = new;
                 self.tail.set(new);
             }
@@ -141,7 +145,8 @@ impl<T> MonoVec<T> {
 
     pub fn chunks(&self) -> Chunks<T> {
         Chunks {
-            chunk: self.head,
+            start: self.head.get(),
+            end: self.tail.get(),
             _ph: PhantomData
         }
     }
@@ -205,27 +210,30 @@ impl io::Write for MonoVec<u8> {
 impl<T> Drop for MonoVec<T> {
     fn drop(&mut self) {
         unsafe {
-            while !self.head.is_null() {
-                let head = self.head;
-                self.head = (*head).next;
+            let mut chunk = self.head.get();
+            let mut next;
+            while !chunk.is_null() {
+                next = (*chunk).next;
                 if intrinsics::needs_drop::<T>() {
-                    let mut cur = (*head).items.as_mut_ptr();
-                    let end = cur.offset((*head).len as isize);
+                    let mut cur = (*chunk).items.as_mut_ptr();
+                    let end = cur.offset((*chunk).len as isize);
                     while cur < end {
                         intrinsics::drop_in_place(cur);
                         cur = cur.offset(1);
                     }
                 }
-                heap::deallocate(head as *mut u8,
-                                 (*head).cap * mem::size_of::<T>(),
+                heap::deallocate(chunk as *mut u8,
+                                 (*chunk).cap * mem::size_of::<T>(),
                                  mem::min_align_of::<T>());
+                chunk = next;
             }
         }
     }
 }
 
 pub struct Chunks<'a, T: 'a> {
-    chunk: *mut Chunk<T>,
+    start: *mut Chunk<T>,
+    end: *mut Chunk<T>,
     _ph: PhantomData<&'a [T]>
 }
 
@@ -233,12 +241,41 @@ impl<'a, T> Iterator for Chunks<'a, T> {
     type Item = &'a [T];
 
     fn next(&mut self) -> Option<&'a [T]> {
-        let chunk = self.chunk;
+        let chunk = self.start;
         if chunk.is_null() {
             None
         } else {
             unsafe {
-                self.chunk = (*chunk).next;
+                if chunk == self.end {
+                    self.start = ptr::null_mut();
+                    self.end = ptr::null_mut()
+                } else {
+                    self.start = (*chunk).next
+                }
+                Some(slice::from_raw_parts((*chunk).items.as_ptr(), (*chunk).len))
+            }
+        }
+    }
+}
+
+unsafe impl <'a, T:Send> Send for Chunks<'a, T> {}
+// FIXME: need to double check that this holds.
+// It certainly doesn't for the vec itself.
+unsafe impl <'a, T:Sync> Sync for Chunks<'a, T> {}
+
+impl<'a, T> DoubleEndedIterator for Chunks<'a, T> {
+    fn next_back(&mut self) -> Option<&'a [T]> {
+        let chunk = self.end;
+        if chunk.is_null() {
+            None
+        } else {
+            unsafe {
+                if chunk == self.start {
+                    self.start = ptr::null_mut();
+                    self.end = ptr::null_mut()
+                } else {
+                    self.end = (*chunk).prev
+                }
                 Some(slice::from_raw_parts((*chunk).items.as_ptr(), (*chunk).len))
             }
         }
@@ -252,6 +289,12 @@ impl<'a, T: 'a> Iterator for Items<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
         self.0.next()
+    }
+}
+
+impl<'a, T: 'a> DoubleEndedIterator for Items<'a, T> {
+    fn next_back(&mut self) -> Option<&'a T> {
+        self.0.next_back()
     }
 }
 
