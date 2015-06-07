@@ -35,15 +35,15 @@ struct Glue<E: ?Sized> {
     // Pointer past end of object
     end: *mut u8,
     // Convert to erased type
-    erase: fn(*mut u8) -> *const E,
+    erase: unsafe fn(*mut u8) -> *const E,
     // Drop glue
-    drop: fn(*mut u8)
+    drop: unsafe fn(*mut u8)
 }
 
 // Function that returns a glue structure
 // One of these is stored prior to each object
 // in the vector.
-type GlueFn<E> = fn(*mut u8) -> Glue<E>;
+type GlueFn<E> = unsafe fn(*mut u8) -> Glue<E>;
 
 pub struct HetVec<'gt, E: ?Sized, S=Unsize> {
     // The actual backing vector
@@ -117,30 +117,24 @@ impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
     }
 
     // Glue function for T
-    fn glue<T>(data: *mut u8) -> Glue<E> where S: Erase<T, E> {
-        fn drop<T>(it: *mut u8) {
-            unsafe {
-                intrinsics::drop_in_place(it as *mut T);
-            }
+    unsafe fn glue<T>(data: *mut u8) -> Glue<E> where S: Erase<T, E> {
+        unsafe fn drop<T>(it: *mut u8) {
+            intrinsics::drop_in_place(it as *mut T);
         }
 
-        fn erase<'a, T:'a, EI: ?Sized, SI>(it: *mut u8) -> *const EI
+        unsafe fn erase<'a, T:'a, EI: ?Sized, SI>(it: *mut u8) -> *const EI
                 where SI: Erase<T, EI> {
-            unsafe {
-                SI::erase(&*(it as *mut T)) as *const EI
-            }
+            SI::erase(&*(it as *mut T)) as *const EI
         }
 
-        unsafe {
-            let obj = data.align_for::<T>();
-            let end = obj.offset(mem::size_of::<T>() as isize);
+        let obj = data.align_for::<T>();
+        let end = obj.offset(mem::size_of::<T>() as isize);
 
-            Glue {
-                obj: obj,
-                end: end,
-                drop: drop::<T>,
-                erase: erase::<T, E, S>
-            }
+        Glue {
+            obj: obj,
+            end: end,
+            drop: drop::<T>,
+            erase: erase::<T, E, S>
         }
     }
 
@@ -162,21 +156,19 @@ impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
         }
     }
 
-    fn stub<T>(data: *mut u8) -> Glue<E> {
-        unsafe {
-            Glue {
-                obj: ptr::null_mut(),
-                end: data.align_for::<T>().offset(mem::size_of::<T>() as isize),
-                drop: mem::uninitialized(),
-                erase: mem::uninitialized()
-            }
+    unsafe fn stub<T>(data: *mut u8) -> Glue<E> {
+        Glue {
+            obj: ptr::null_mut(),
+            end: data.align_for::<T>().offset(mem::size_of::<T>() as isize),
+            drop: mem::uninitialized(),
+            erase: mem::uninitialized()
         }
     }
 
     pub fn emplace<T:'gt, F: FnOnce() -> T>(&self, f: F) -> &T
            where S: Erase<T, E> {
         unsafe {
-            let (glue, obj) = self.alloc::<T>();
+            let (glue, obj, len) = self.alloc::<T>();
             // Write a stub glue function in case `f` panics
             ptr::write(glue, Self::stub::<T>);
             self.vec.add_len(len);
@@ -197,17 +189,6 @@ impl<'gt, 'a, E: ?Sized, S> IntoIterator for &'a HetVec<'gt, E, S> {
             cur: ptr::null_mut(),
             end: ptr::null_mut(),
             _ph: PhantomData
-        }
-    }
-}
-
-impl<'gt, 'a, E, S> IntoIterator for &'a mut HetVec<'gt, E, S> {
-    type Item = &'a mut E;
-    type IntoIter = MutItems<'a, E>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        MutItems {
-            real: (&*self).into_iter()
         }
     }
 }
@@ -239,10 +220,6 @@ pub struct Items<'a, E: ?Sized> {
     _ph: PhantomData<E>
 }
 
-pub struct MutItems<'a, E: ?Sized> {
-    real: Items<'a, E>
-}
-
 impl<'a, E: ?Sized> Iterator for Items<'a, E> {
     type Item = &'a E;
 
@@ -271,20 +248,12 @@ impl<'a, E: ?Sized> Iterator for Items<'a, E> {
     }
 }
 
-impl<'a, E: ?Sized> Iterator for MutItems<'a, E> {
-    type Item = &'a mut E;
-
-    fn next(&mut self) -> Option<&'a mut E> {
-        unsafe { mem::transmute(self.real.next()) }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
     use std::fmt::{self, Display};
     use std::str;
-    
+
     #[test]
     fn unsize_trait() {
         struct Hi;
