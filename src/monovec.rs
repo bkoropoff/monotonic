@@ -208,13 +208,17 @@ impl<T> Drop for MonoVec<T> {
             while !self.head.is_null() {
                 let head = self.head;
                 self.head = (*head).next;
-                let start = (*head).items.as_mut_ptr();
-                let end = start.offset((*head).len as isize);
-                let mut cur = start;
-                while cur < end {
-                    intrinsics::drop_in_place(cur);
-                    cur = cur.offset(1);
+                if intrinsics::needs_drop::<T>() {
+                    let mut cur = (*head).items.as_mut_ptr();
+                    let end = cur.offset((*head).len as isize);
+                    while cur < end {
+                        intrinsics::drop_in_place(cur);
+                        cur = cur.offset(1);
+                    }
                 }
+                heap::deallocate(head as *mut u8,
+                                 (*head).cap * mem::size_of::<T>(),
+                                 mem::min_align_of::<T>());
             }
         }
     }
