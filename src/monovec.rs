@@ -298,6 +298,21 @@ impl<'a, T: 'a> DoubleEndedIterator for Items<'a, T> {
     }
 }
 
+impl<T: fmt::Debug> fmt::Debug for MonoVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut need_comma = false;
+        try!(write!(f, "["));
+        for elem in self {
+            if need_comma {
+                try!(write!(f, ", "));
+            }
+            try!(elem.fmt(f));
+            need_comma = true;
+        }
+        write!(f, "]")
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

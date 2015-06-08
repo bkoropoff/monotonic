@@ -1,5 +1,6 @@
 use super::monovec::{MonoVec, Chunks};
 use std::marker::{self, PhantomData};
+use std::fmt;
 use std::ops;
 use std::mem;
 use std::ptr;
@@ -352,6 +353,20 @@ impl<'a, E: ?Sized> DoubleEndedIterator for Items<'a, E> {
     }
 }
 
+impl<'gt, E: ?Sized + fmt::Debug, S> fmt::Debug for HetVec<'gt, E, S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut need_comma = false;
+        try!(write!(f, "["));
+        for elem in self {
+            if need_comma {
+                try!(write!(f, ", "));
+            }
+            try!(elem.fmt(f));
+            need_comma = true;
+        }
+        write!(f, "]")
+    }
+}
 
 #[cfg(test)]
 mod test {
