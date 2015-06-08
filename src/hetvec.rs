@@ -4,6 +4,9 @@ use std::ops;
 use std::mem;
 use std::ptr;
 use std::intrinsics;
+use std::cell::Cell;
+
+const SENTINEL: usize = !0;
 
 pub trait Erase<T: ?Sized, E: ?Sized> {
     fn erase(real: &T) -> &E;
@@ -29,7 +32,7 @@ impl<T: ?Sized, E: ?Sized> Erase<T, E> for Deref
     }
 }
 
-struct Glue<E: ?Sized> {
+struct Forward<E: ?Sized> {
     // Pointer to object
     obj: *mut u8,
     // Pointer past end of object
@@ -37,17 +40,50 @@ struct Glue<E: ?Sized> {
     // Convert to erased type
     erase: unsafe fn(*mut u8) -> *const E,
     // Drop glue
-    drop: unsafe fn(*mut u8)
+    drop: unsafe fn(*mut u8),
+    // Backward function
+    backward: BackwardFn<E>
 }
 
-// Function that returns a glue structure
+// Function that returns a Forward structure
 // One of these is stored prior to each object
 // in the vector.
-type GlueFn<E> = unsafe fn(*mut u8) -> Glue<E>;
+type ForwardFn<E> = unsafe fn(*mut FencePost<E>) -> Forward<E>;
+
+struct Backward<E: ?Sized> {
+    forward: ForwardFn<E>,
+    fence: *mut FencePost<E>
+}
+
+type BackwardFn<E> = unsafe fn(*mut u8) -> Backward<E>;
+
+struct FencePost<E: ?Sized> {
+    word: usize,
+    _ph: PhantomData<E>
+}
+
+impl<E: ?Sized> FencePost<E> {
+    fn new(f: ForwardFn<E>, b: BackwardFn<E>) -> Self {
+        FencePost {
+            word: f as usize ^ b as usize,
+            _ph: PhantomData
+        }
+    }
+    
+    unsafe fn forward(&self, b: BackwardFn<E>) -> ForwardFn<E> {
+        mem::transmute(self.word ^ b as usize)
+    }
+    
+    unsafe fn backward(&self, f: ForwardFn<E>) -> BackwardFn<E> {
+        mem::transmute(self.word ^ f as usize)
+    }
+}
 
 pub struct HetVec<'gt, E: ?Sized, S=Unsize> {
     // The actual backing vector
     vec: MonoVec<u8>,
+    // Most recent backward function
+    backward: Cell<BackwardFn<E>>,
     // Indicate we contain E, ignore S,
     // and that 'gt must strictly outlive us
     _ph: PhantomData<(E, *const S, *mut &'gt ())>
@@ -103,6 +139,7 @@ impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
     pub fn with_capacity(cap: usize) -> Self {
         HetVec {
             vec: MonoVec::with_capacity(cap),
+            backward: Cell::new(unsafe { mem::transmute(0usize) }),
             _ph: PhantomData
         }
     }
@@ -116,8 +153,8 @@ impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
         mem::size_of::<T>() + mem::min_align_of::<T>() - 1
     }
 
-    // Glue function for T
-    unsafe fn glue<T>(data: *mut u8) -> Glue<E> where S: Erase<T, E> {
+    // Forward function for T
+    unsafe fn forward<T>(fence: *mut FencePost<E>) -> Forward<E> where S: Erase<T, E> {
         unsafe fn drop<T>(it: *mut u8) {
             intrinsics::drop_in_place(it as *mut T);
         }
@@ -127,53 +164,59 @@ impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
             SI::erase(&*(it as *mut T)) as *const EI
         }
 
-        let obj = data.align_for::<T>();
+        let obj = fence.offset(1).align_for::<T>() as *mut u8;
         let end = obj.offset(mem::size_of::<T>() as isize);
 
-        Glue {
+        Forward {
             obj: obj,
             end: end,
             drop: drop::<T>,
-            erase: erase::<T, E, S>
+            erase: erase::<T, E, S>,
+            backward: Self::backward::<T>
+        }
+    }
+    
+    // Backward function for T
+    unsafe fn backward<T>(end: *mut u8) -> Backward<E> where S: Erase<T, E> {
+        let mut ptr = end.offset(-(mem::size_of::<T>() as isize));
+        
+        if mem::min_align_of::<T>() <= mem::min_align_of::<FencePost<E>>() {
+            ptr = (ptr as usize & !(mem::min_align_of::<FencePost<E>>() - 1)) as *mut u8;
+            ptr = ptr.offset(-(mem::size_of::<FencePost<E>>() as isize));
+        } else {
+            ptr = ptr.offset(-(mem::size_of::<FencePost<E>>() as isize));
+            while *(ptr as *mut usize) ^ Self::forward::<T> as usize == SENTINEL {
+                ptr = ptr.offset(-(mem::min_align_of::<usize>() as isize))
+            }
+        }
+
+        Backward {
+            forward: Self::forward::<T>,
+            fence: ptr as *mut FencePost<E>
         }
     }
 
-    unsafe fn alloc<T>(&self) -> (*mut GlueFn<E>, *mut T, usize) {
-        let size = Self::space_for::<GlueFn<E>>() + Self::space_for::<T>();
+    unsafe fn alloc<T>(&self) -> *mut T where S: Erase<T, E> {
+        let size = Self::space_for::<FencePost<E>>() + Self::space_for::<T>();
         let (space, _) = self.vec.reserve(size);
-        let glue = space.align_for::<GlueFn<E>>() as *mut GlueFn<E>;
-        let obj = glue.offset(1).align_for::<T>() as *mut T;
-        (glue, obj, obj.offset(1).diff(space) as usize)
+        let fence = space.align_for::<FencePost<E>>() as *mut FencePost<E>;
+        let obj = fence.offset(1).align_for::<T>() as *mut T;
+        self.vec.add_len(obj.offset(1).diff(space) as usize);
+        // Fill padding with sentinel value
+        let mut sentinel = fence.offset(1) as *mut usize;
+        while sentinel != obj as *mut usize {
+            *sentinel = Self::forward::<T> as usize ^ SENTINEL;
+            sentinel = sentinel.offset(mem::size_of::<usize>() as isize);
+        }
+        *fence = FencePost::new(Self::forward::<T>, self.backward.get());
+        obj
     }
 
     pub fn push<T:'gt>(&self, elem: T) -> &T where S: Erase<T, E> {
         unsafe {
-            let (glue, obj, len) = self.alloc::<T>();
-            ptr::write(glue, Self::glue::<T>);
+            let obj = self.alloc::<T>();
             ptr::write(obj, elem);
-            self.vec.add_len(len);
-            &*obj
-        }
-    }
-
-    unsafe fn stub<T>(data: *mut u8) -> Glue<E> {
-        Glue {
-            obj: ptr::null_mut(),
-            end: data.align_for::<T>().offset(mem::size_of::<T>() as isize),
-            drop: mem::uninitialized(),
-            erase: mem::uninitialized()
-        }
-    }
-
-    pub fn emplace<T:'gt, F: FnOnce() -> T>(&self, f: F) -> &T
-           where S: Erase<T, E> {
-        unsafe {
-            let (glue, obj, len) = self.alloc::<T>();
-            // Write a stub glue function in case `f` panics
-            ptr::write(glue, Self::stub::<T>);
-            self.vec.add_len(len);
-            ptr::write(obj, f());
-            ptr::write(glue, Self::glue::<T>);
+            self.backward.set(Self::backward::<T>);
             &*obj
         }
     }
@@ -188,6 +231,10 @@ impl<'gt, 'a, E: ?Sized, S> IntoIterator for &'a HetVec<'gt, E, S> {
             chunks: self.vec.chunks(),
             cur: ptr::null_mut(),
             end: ptr::null_mut(),
+            back_cur: ptr::null_mut(),
+            back_start: ptr::null_mut(),
+            backward: unsafe { mem::transmute(0usize) },
+            back_backward: self.backward.get(),
             _ph: PhantomData
         }
     }
@@ -196,17 +243,21 @@ impl<'gt, 'a, E: ?Sized, S> IntoIterator for &'a HetVec<'gt, E, S> {
 impl<'gt, E: ?Sized, S> Drop for HetVec<'gt, E, S> {
     fn drop(&mut self) {
         unsafe {
+            let mut backward = mem::transmute(0usize);
+        
             for chunk in self.vec.chunks() {
                 let mut cur = chunk.as_ptr() as *mut u8;
                 let end = cur.offset(chunk.len() as isize);
                 while cur != end {
-                    let glue_fn = cur.align_for::<GlueFn<E>>() as *mut GlueFn<E>;
-                    let glue = (*glue_fn)(glue_fn.offset(1) as *mut u8);
+                    let fence = cur.align_for::<FencePost<E>>() as *mut FencePost<E>;
+                    let forward_fn = (*fence).forward(backward);
+                    let forward = forward_fn(fence);
                     // Skip stub entries
-                    if !glue.obj.is_null() {
-                        (glue.drop)(glue.obj);
+                    if !forward.obj.is_null() {
+                        (forward.drop)(forward.obj);
                     }
-                    cur = glue.end;
+                    cur = forward.end;
+                    backward = forward.backward;
                 }
             }
         }
@@ -217,6 +268,10 @@ pub struct Items<'a, E: ?Sized> {
     chunks: Chunks<'a, u8>,
     cur: *mut u8,
     end: *mut u8,
+    back_cur: *mut u8,
+    back_start: *mut u8,
+    backward: BackwardFn<E>,
+    back_backward: BackwardFn<E>,
     _ph: PhantomData<E>
 }
 
@@ -232,21 +287,71 @@ impl<'a, E: ?Sized> Iterator for Items<'a, E> {
                             self.cur = s.as_ptr() as *mut u8;
                             self.end = self.cur.offset(s.len() as isize);
                         }
-                        None => return None
+                        None => { 
+                            if self.back_start.is_null() {
+                                return None
+                            } else {
+                                self.cur = self.back_start;
+                                self.end = self.back_cur;
+                            }
+                        }
                     }
                 }
 
-                let glue_fn = self.cur.align_for::<GlueFn<E>>() as *mut GlueFn<E>;
-                let glue = (*glue_fn)(glue_fn.offset(1) as *mut u8);
-                self.cur = glue.end;
+                let fence = self.cur.align_for::<FencePost<E>>() as *mut FencePost<E>;
+                let forward_fn = (*fence).forward(self.backward);
+                let forward = forward_fn(fence);
+                if self.back_start == self.cur {
+                    self.back_start = forward.end
+                }
+                self.cur = forward.end;
+                self.backward = forward.backward;
                 // Skip stub entries
-                if !glue.obj.is_null() {
-                    return Some(&*(glue.erase)(glue.obj))
+                if !forward.obj.is_null() {
+                    return Some(&*(forward.erase)(forward.obj))
                 }
             }
         }
     }
 }
+
+impl<'a, E: ?Sized> DoubleEndedIterator for Items<'a, E> {
+    fn next_back(&mut self) -> Option<&'a E> {
+        loop {
+            unsafe {
+                while self.back_cur == self.back_start {
+                    match self.chunks.next_back() {
+                        Some(s) => {
+                            self.back_start = s.as_ptr() as *mut u8;
+                            self.back_cur = self.back_start.offset(s.len() as isize);
+                        }
+                        None => {
+                            if self.end.is_null() {
+                                return None 
+                            } else {
+                                self.back_cur = self.end;
+                                self.back_start = self.cur;
+                            }
+                        }
+                    }
+                }
+
+                let backward = (self.back_backward)(self.back_cur);
+                let forward = (backward.forward)(backward.fence);
+                if self.end == self.back_cur {
+                    self.end = backward.fence as *mut u8;
+                }
+                self.back_cur = backward.fence as *mut u8;
+                self.back_backward = (*backward.fence).backward(backward.forward);
+                // Skip stub entries
+                if !forward.obj.is_null() {
+                    return Some(&*(forward.erase)(forward.obj))
+                }
+            }
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod test {
@@ -272,6 +377,10 @@ mod test {
         vec.push(Hi);
 
         for item in &vec {
+            println!("{}", item);
+        }
+
+        for item in vec.into_iter().rev() {
             println!("{}", item);
         }
     }

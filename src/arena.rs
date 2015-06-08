@@ -9,6 +9,7 @@ pub struct TypedArena<T> {
 impl<T> TypedArena<T> {
     #[allow(mutable_transmutes)]
     pub fn alloc<F: FnOnce() -> T>(&self, f: F) -> &mut T {
+        // FIXME: we need a way to emplace inside the underlying vec
         unsafe { mem::transmute(self.vec.push(f())) }
     }
 
@@ -37,6 +38,7 @@ pub struct Arena<'gt> {
 impl<'gt> Arena<'gt> {
     #[allow(mutable_transmutes)]
     pub fn alloc<T: 'gt, F: FnOnce() -> T>(&self, f: F) -> &mut T {
-        unsafe { mem::transmute(self.vec.emplace(f)) }
+        // FIXME: we need a way to emplace inside the underlying vec
+        unsafe { mem::transmute(self.vec.push(f())) }
     }
 }
