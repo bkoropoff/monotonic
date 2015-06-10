@@ -1,4 +1,4 @@
-use super::monovec::{MonoVec, Chunks};
+use super::chain::{Chain, Chunks};
 use std::marker::{self, PhantomData};
 use std::fmt;
 use std::ops;
@@ -80,9 +80,9 @@ impl<E: ?Sized> FencePost<E> {
     }
 }
 
-pub struct HetVec<'gt, E: ?Sized, S=Unsize> {
+pub struct DynChain<'gt, E: ?Sized, S=Unsize> {
     // The actual backing vector
-    vec: MonoVec<u8>,
+    vec: Chain<u8>,
     // Most recent backward function
     backward: Cell<BackwardFn<E>>,
     // Indicate we contain E, ignore S,
@@ -90,7 +90,7 @@ pub struct HetVec<'gt, E: ?Sized, S=Unsize> {
     _ph: PhantomData<(E, *const S, *mut &'gt ())>
 }
 
-unsafe impl<'gt, E: ?Sized + Send, S> Send for HetVec<'gt, E, S> {}
+unsafe impl<'gt, E: ?Sized + Send, S> Send for DynChain<'gt, E, S> {}
 
 // Some utility methods for raw pointer
 trait PtrUtil: Sized {
@@ -132,14 +132,14 @@ impl<T> PtrUtil for *mut T {
     }
 }
 
-impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
+impl<'gt, E: ?Sized, S=Unsize> DynChain<'gt, E, S> {
     pub fn new() -> Self {
         Self::with_capacity(128)
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        HetVec {
-            vec: MonoVec::with_capacity(cap),
+        DynChain {
+            vec: Chain::with_capacity(cap),
             backward: Cell::new(unsafe { mem::transmute(0usize) }),
             _ph: PhantomData
         }
@@ -223,7 +223,7 @@ impl<'gt, E: ?Sized, S=Unsize> HetVec<'gt, E, S> {
     }
 }
 
-impl<'gt, 'a, E: ?Sized, S> IntoIterator for &'a HetVec<'gt, E, S> {
+impl<'gt, 'a, E: ?Sized, S> IntoIterator for &'a DynChain<'gt, E, S> {
     type Item = &'a E;
     type IntoIter = Items<'a, E>;
 
@@ -241,7 +241,7 @@ impl<'gt, 'a, E: ?Sized, S> IntoIterator for &'a HetVec<'gt, E, S> {
     }
 }
 
-impl<'gt, E: ?Sized, S> Drop for HetVec<'gt, E, S> {
+impl<'gt, E: ?Sized, S> Drop for DynChain<'gt, E, S> {
     fn drop(&mut self) {
         unsafe {
             let mut backward = mem::transmute(0usize);
@@ -353,7 +353,7 @@ impl<'a, E: ?Sized> DoubleEndedIterator for Items<'a, E> {
     }
 }
 
-impl<'gt, E: ?Sized + fmt::Debug, S> fmt::Debug for HetVec<'gt, E, S> {
+impl<'gt, E: ?Sized + fmt::Debug, S> fmt::Debug for DynChain<'gt, E, S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut need_comma = false;
         try!(write!(f, "["));
@@ -386,7 +386,7 @@ mod test {
             }
         }
                 
-        let vec: HetVec<Display> = HetVec::new();
+        let vec: DynChain<Display> = DynChain::new();
         vec.push(42);
         vec.push("Weasel");
         vec.push(Hi);
@@ -402,7 +402,7 @@ mod test {
 
     #[test]
     fn unsize_slice() {
-        let vec: HetVec<[u8]> = HetVec::new();
+        let vec: DynChain<[u8]> = DynChain::new();
         vec.push(*b"hello");
 
         for item in &vec {
@@ -412,7 +412,7 @@ mod test {
 
     #[test]
     fn deref_str() {
-        let vec: HetVec<str, Deref> = HetVec::new();
+        let vec: DynChain<str, Deref> = DynChain::new();
         vec.push(format!("Hello"));
         vec.push("world");
 

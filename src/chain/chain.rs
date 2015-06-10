@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::intrinsics;
 
-// A chunk in the vector
+// A chunk in the chain
 struct Chunk<T> {
     // Previous chunk
     prev: *mut Chunk<T>,
@@ -24,13 +24,13 @@ struct Chunk<T> {
     items: [T; 0]
 }
 
-pub struct MonoVec<T> {
+pub struct Chain<T> {
     head: Cell<*mut Chunk<T>>,
     tail: Cell<*mut Chunk<T>>,
     _ph: PhantomData<T>
 }
 
-unsafe impl<T: Send> Send for MonoVec<T> {}
+unsafe impl<T: Send> Send for Chain<T> {}
 
 impl<T> Chunk<T> {
     fn array_size(len: usize) -> usize {
@@ -46,7 +46,7 @@ impl<T> Chunk<T> {
             let res = heap::allocate(Self::mem_size(cap),
                                      mem::align_of::<Self>()) as *mut Self;
             if res.is_null() {
-                panic!("MonoVec: failed to allocate chunk!")
+                panic!("Chain: failed to allocate chunk!")
             }
             ptr::write(&mut (*res).prev, ptr::null_mut());
             ptr::write(&mut (*res).next, ptr::null_mut());
@@ -57,14 +57,14 @@ impl<T> Chunk<T> {
     }
 }
 
-impl<T> MonoVec<T> {
+impl<T> Chain<T> {
     pub fn new() -> Self {
         Self::with_capacity(8)
     }
     
     pub fn with_capacity(cap: usize) -> Self {
         let head = Chunk::new(cmp::max(cap, 1));
-        MonoVec {
+        Chain {
             head: Cell::new(head),
             tail: Cell::new(head),
             _ph: PhantomData
@@ -207,7 +207,7 @@ impl<T> MonoVec<T> {
     }
 }
 
-impl<'a, T: 'a> IntoIterator for &'a MonoVec<T> {
+impl<'a, T: 'a> IntoIterator for &'a Chain<T> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T>;
 
@@ -216,7 +216,7 @@ impl<'a, T: 'a> IntoIterator for &'a MonoVec<T> {
     }
 }
 
-impl<'a, T: 'a> IntoIterator for &'a mut MonoVec<T> {
+impl<'a, T: 'a> IntoIterator for &'a mut Chain<T> {
     type Item = &'a mut T;
     type IntoIter = IterMut<'a, T>;
 
@@ -225,7 +225,7 @@ impl<'a, T: 'a> IntoIterator for &'a mut MonoVec<T> {
     }
 }
 
-impl<T> IntoIterator for MonoVec<T> {
+impl<T> IntoIterator for Chain<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
 
@@ -244,7 +244,7 @@ impl<T> IntoIterator for MonoVec<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for MonoVec<T> {
+impl<T: fmt::Debug> fmt::Debug for Chain<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut need_comma = false;
         try!(write!(f, "["));
@@ -259,7 +259,7 @@ impl<T: fmt::Debug> fmt::Debug for MonoVec<T> {
     }
 }
 
-impl io::Write for MonoVec<u8> {
+impl io::Write for Chain<u8> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let (ptr, len) = self.reserve(0);
         let len = cmp::min(len, buf.len());
@@ -276,7 +276,7 @@ impl io::Write for MonoVec<u8> {
     }
 }
 
-impl<T> Drop for MonoVec<T> {
+impl<T> Drop for Chain<T> {
     fn drop(&mut self) {
         self.clear();
         let chunk = self.head.get();

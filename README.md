@@ -15,22 +15,19 @@ some of the intended use cases.
 
 ## Work so far ##
 
-### `MonoVec<T>` ###
+### `Chain<T>` ###
 
-A monotonically-growing vector of `T` which permits immutable
-iteration of elements.
+Like a `Vec<T>`, except memory chunks are kept in a linked list as
+the structure grows rather than being reallocated.  This permits
+appending through `&self`.
 
-The `MonoVec<u8>::format` method performs string formatting and
-returns a contiguous string slice of the result, making it useful
-as an arena for temporary strings.
+### `DynChain<E>` ###
 
-### `HetVec<E>` ###
-
-Similar to `MonoVec`, but allows pushing arbitrary types which
+Similar to `Chain`, but allows appending arbitrary types which
 can erase to `E`, e.g. by unsizing:
 
 ```rust
-let vec: HetVec<Display> = HetVec::new();
+let vec: DynChain<Display> = DynChain::new();
 vec.push(42);
 vec.push(3.14);
 vec.push("Lasagna");
@@ -40,15 +37,32 @@ for item in &vec {
 }
 ```
 
-Elements are stored contiguously interspered with vtable pointers and alignment
-padding.
+Elements are stored contiguously in the chunks of the underlying chain,
+interspered with metadata words and any alignment padding.  If the
+stored types have the same minimum alignment as `usize`, the overhead
+is one `usize` per element.
 
-### `TypedArena<T>` ###
+### `Zone<T>` ###
 
-A thin wrapper around `MonoVec<T>` which works like the version in rustc's
-libarena.
+A thin wrapper around `Chain<T>` which acts as a zone allocator
+of `T`s.  The contents cannot be iterated, but in return freshly
+allocated elements are mutable.
 
-### `Arena` ###
+When `T` is `Copy`, you can use `Zone::alloc` to allocate space
+for a contiguous chunk of elements, then fill the space incrementally
+through the returned `Quota` handle.  Once filled, `Quota::into_slice`
+converts the handle into a mutable slice of the allocated elements.
+Note that if multiple allocations are made simultaneously, unused space
+between them can be wasted.
 
-A thin wrapper around `HetVec` which works like the version in rustc's
-libarena.
+For the special case of `Zone<u8>`, returned quota handles implement
+the `std::io::Write` trait.  You can also use `Zone::alloc_str` to
+acquire a `QuotaStr` handle, which implements `std::fmt::Write`.
+The `Zone::format` will handle allocating enough space to fit the
+entire output of a format operation and return the resulting string
+slice.
+
+### `DynZone` ###
+
+A thin wrapper around `DynChain` which permits allocating different
+types in the same zone at the cost of metadata and padding overhead.

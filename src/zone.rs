@@ -1,5 +1,4 @@
-use super::monovec::MonoVec;
-use super::hetvec::{Erase, HetVec};
+use super::chain::{Chain, DynChain, Erase};
 use std::mem;
 use std::ptr;
 use std::cmp;
@@ -8,11 +7,11 @@ use std::io;
 use std::slice;
 use std::intrinsics;
 
-pub struct TypedArena<T> {
-    vec: MonoVec<T>
+pub struct Zone<T> {
+    chain: Chain<T>
 }
 
-impl<T> TypedArena<T> {
+impl<T> Zone<T> {
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(8)
@@ -20,15 +19,15 @@ impl<T> TypedArena<T> {
 
     #[inline]
     pub fn with_capacity(count: usize) -> Self {
-        TypedArena {
-            vec: MonoVec::with_capacity(count)
+        Zone {
+            chain: Chain::with_capacity(count)
         }
     }
 
     #[inline]
     #[allow(mutable_transmutes)]
     pub fn push(&self, elem: T) -> &mut T {
-        unsafe { mem::transmute(self.vec.push(elem)) }
+        unsafe { mem::transmute(self.chain.push(elem)) }
     }
 
     // We only permit allocation of chunks for Copy types
@@ -37,8 +36,8 @@ impl<T> TypedArena<T> {
     // drop.
     pub fn alloc(&self, len: usize) -> Quota<T> where T: Copy {
         unsafe {
-            let (origin, cap) = self.vec.reserve(len);
-            self.vec.add_len(cap);
+            let (origin, cap) = self.chain.reserve(len);
+            self.chain.add_len(cap);
             Quota {
                 origin: origin,
                 len: 0,
@@ -49,7 +48,7 @@ impl<T> TypedArena<T> {
     }
 }
 
-impl TypedArena<u8> {
+impl Zone<u8> {
     pub fn alloc_str(&self, len: usize) -> StrQuota {
         StrQuota(self.alloc(len))
     }
@@ -70,13 +69,13 @@ impl TypedArena<u8> {
     }
 }
 
-// A Quota is basically a write-only Vec pointing into a TypedArena
+// A Quota is basically a write-only Vec pointing into a Zone
 // that can be converted into a slice after filling it
 pub struct Quota<'a, T: 'a> {
     origin: *mut T,
     len: usize,
     cap: usize,
-    arena: &'a TypedArena<T>
+    arena: &'a Zone<T>
 }
 
 impl<'a, T> Quota<'a, T> {
@@ -158,7 +157,7 @@ impl<'a, T> Drop for Quota<'a, T> {
     fn drop(&mut self) {
         // Shrink the allocation if we haven't already allocated more space past it.
         unsafe {
-            self.arena.vec.shrink_len(self.origin, self.cap, self.len)
+            self.arena.chain.shrink_len(self.origin, self.cap, self.len)
         }
     }
 }
@@ -223,15 +222,15 @@ impl<T> Erase<T, ()> for Forget {
     }
 }
 
-pub struct Arena<'gt> {
-    vec: HetVec<'gt, (), Forget>
+pub struct DynZone<'gt> {
+    chain: DynChain<'gt, (), Forget>
 }
 
-impl<'gt> Arena<'gt> {
+impl<'gt> DynZone<'gt> {
     #[allow(mutable_transmutes)]
     pub fn alloc<T: 'gt, F: FnOnce() -> T>(&self, f: F) -> &mut T {
-        // FIXME: we need a way to emplace inside the underlying vec
-        unsafe { mem::transmute(self.vec.push(f())) }
+        // FIXME: we need a way to emplace inside the underlying chain
+        unsafe { mem::transmute(self.chain.push(f())) }
     }
 }
 
@@ -241,7 +240,7 @@ mod test {
 
     #[test]
     fn format() {
-        let buffer = TypedArena::new();
+        let buffer = Zone::new();
         for i in 0..100 {
             assert_eq!(buffer.format(format_args!("hello {}", i)),
                        format!("hello {}", i));
