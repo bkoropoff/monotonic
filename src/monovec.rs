@@ -45,6 +45,9 @@ impl<T> Chunk<T> {
         unsafe {
             let res = heap::allocate(Self::mem_size(cap),
                                      mem::align_of::<Self>()) as *mut Self;
+            if res.is_null() {
+                panic!("MonoVec: failed to allocate chunk!")
+            }
             ptr::write(&mut (*res).prev, ptr::null_mut());
             ptr::write(&mut (*res).next, ptr::null_mut());
             ptr::write(&mut (*res).len, 0);
