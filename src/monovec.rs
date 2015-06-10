@@ -152,6 +152,31 @@ impl<T> MonoVec<T> {
             slice::from_raw_parts(ptr, len)
         }
     }
+    
+    pub fn clear(&mut self) {
+        unsafe {
+            loop {
+                let chunk = self.head.get();
+                self.head.set((*chunk).next);
+                if intrinsics::needs_drop::<T>() {
+                    let ptr = (*chunk).items.as_mut_ptr();
+                    let end = ptr.offset((*chunk).len as isize);
+                    while ptr < end {
+                        intrinsics::drop_in_place(ptr);
+                    }
+                }
+                if chunk == self.tail.get() {
+                    break
+                }
+                heap::deallocate(chunk as *mut u8,
+                                 mem::size_of::<Chunk<T>>() + (*chunk).len * mem::size_of::<T>(),
+                                 mem::align_of::<Chunk<T>>());
+            }
+            let save = self.tail.get();
+            self.head.set(save);
+            (*save).len = 0;
+        }
+    }
 
     pub fn chunks(&self) -> Chunks<T> {
         Chunks {
@@ -196,24 +221,13 @@ impl io::Write for MonoVec<u8> {
 
 impl<T> Drop for MonoVec<T> {
     fn drop(&mut self) {
+        self.clear();
+        let chunk = self.head.get();
         unsafe {
-            let mut chunk = self.head.get();
-            let mut next;
-            while !chunk.is_null() {
-                next = (*chunk).next;
-                if intrinsics::needs_drop::<T>() {
-                    let mut cur = (*chunk).items.as_mut_ptr();
-                    let end = cur.offset((*chunk).len as isize);
-                    while cur < end {
-                        intrinsics::drop_in_place(cur);
-                        cur = cur.offset(1);
-                    }
-                }
-                heap::deallocate(chunk as *mut u8,
-                                 (*chunk).cap * mem::size_of::<T>(),
-                                 mem::min_align_of::<T>());
-                chunk = next;
-            }
+            heap::deallocate(chunk as *mut u8,
+                             mem::size_of::<Chunk<T>>() + (*chunk).len * mem::size_of::<T>(),
+                             mem::align_of::<Chunk<T>>());
+
         }
     }
 }
