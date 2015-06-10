@@ -5,7 +5,6 @@ use std::slice;
 use std::iter;
 use std::io::{self, Write};
 use std::cmp;
-use std::str;
 use std::rt::heap;
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -114,7 +113,15 @@ impl<T> MonoVec<T> {
     // writing into reserved space.
     pub unsafe fn add_len(&self, len: usize) {
         let tail = self.tail.get();
-        (*tail).len = len.checked_add((*tail).len).unwrap();
+        (*tail).len += len;
+    }
+
+    // Shrinks length of allocation at (ptr, ptr + old_len) if possible
+    pub unsafe fn shrink_len(&self, ptr: *mut T, old_len: usize, new_len: usize) {
+        let tail = self.tail.get();
+        if ptr.offset(old_len as isize) == (*tail).items.as_mut_ptr().offset((*tail).len as isize) {
+            (*tail).len = (*tail).len - old_len + new_len;
+        }
     }
 
     #[inline]
@@ -127,7 +134,7 @@ impl<T> MonoVec<T> {
         }
     }
 
-    pub fn push_as_slice<E: IntoIterator<Item=T>>(&self, elems: E) -> &[T]
+    pub fn extend_as_slice<E: IntoIterator<Item=T>>(&self, elems: E) -> &[T]
             where E::IntoIter: ExactSizeIterator {
         let iter = elems.into_iter();
         let len = iter.len();
@@ -164,29 +171,6 @@ impl<'a, T: 'a> IntoIterator for &'a MonoVec<T> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.items()
-    }
-}
-
-impl MonoVec<u8> {
-    pub fn format(&self, args: fmt::Arguments) -> &str {
-        let mut needed = 1;
-        loop {
-            let (ptr, len) = self.reserve(needed);
-            let mut slice = unsafe { slice::from_raw_parts_mut(ptr, len) };
-            let res = slice.write_fmt(args);
-            match res {
-                Ok(()) => unsafe {
-                    let len = len - slice.len();
-                    self.add_len(len);
-                    return str::from_utf8_unchecked(slice::from_raw_parts(ptr, len))
-                },
-                Err(ref err) if err.kind() == io::ErrorKind::WriteZero => {
-                    needed = len + 1;
-                    continue
-                }
-                Err(err) => panic!(err)
-            }
-        }
     }
 }
 
@@ -310,19 +294,5 @@ impl<T: fmt::Debug> fmt::Debug for MonoVec<T> {
             need_comma = true;
         }
         write!(f, "]")
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn format() {
-        let buffer = MonoVec::new();
-        for i in 0..100 {
-            assert_eq!(buffer.format(format_args!("hello {}", i)),
-                       format!("hello {}", i));
-        }
     }
 }
