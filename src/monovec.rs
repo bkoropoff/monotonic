@@ -185,20 +185,77 @@ impl<T> MonoVec<T> {
             _ph: PhantomData
         }
     }
+    
+    pub fn chunks_mut(&mut self) -> ChunksMut<T> {
+        ChunksMut {
+            start: self.head.get(),
+            end: self.tail.get(),
+            _ph: PhantomData
+        }
+    }
 
-    pub fn items(&self) -> Items<T> {
+    pub fn iter(&self) -> Iter<T> {
         #[inline(always)]
         fn id<T>(x: T) -> T { x }
-        Items(self.chunks().flat_map(id))
+        Iter(self.chunks().flat_map(id))
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<T> {
+        #[inline(always)]
+        fn id<T>(x: T) -> T { x }
+        IterMut(self.chunks_mut().flat_map(id))
     }
 }
 
 impl<'a, T: 'a> IntoIterator for &'a MonoVec<T> {
     type Item = &'a T;
-    type IntoIter = Items<'a, T>;
+    type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.items()
+        self.iter()
+    }
+}
+
+impl<'a, T: 'a> IntoIterator for &'a mut MonoVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T> IntoIterator for MonoVec<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        unsafe {
+            let start = self.head.get();
+            let end = self.tail.get();
+            mem::forget(self);
+            IntoIter {
+                start: start,
+                end: end,
+                front: (*start).items.as_mut_ptr(),
+                _ph: PhantomData
+            }
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for MonoVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut need_comma = false;
+        try!(write!(f, "["));
+        for elem in self {
+            if need_comma {
+                try!(write!(f, ", "));
+            }
+            try!(elem.fmt(f));
+            need_comma = true;
+        }
+        write!(f, "]")
     }
 }
 
@@ -260,8 +317,6 @@ impl<'a, T> Iterator for Chunks<'a, T> {
 }
 
 unsafe impl <'a, T:Send> Send for Chunks<'a, T> {}
-// FIXME: need to double check that this holds.
-// It certainly doesn't for the vec itself.
 unsafe impl <'a, T:Sync> Sync for Chunks<'a, T> {}
 
 impl<'a, T> DoubleEndedIterator for Chunks<'a, T> {
@@ -283,33 +338,159 @@ impl<'a, T> DoubleEndedIterator for Chunks<'a, T> {
     }
 }
 
-// Wrapper to hide ugly adapter type
-pub struct Items<'a, T: 'a>(iter::FlatMap<Chunks<'a, T>, &'a [T], fn(&'a [T]) -> &'a [T]>);
+pub struct ChunksMut<'a, T: 'a> {
+    start: *mut Chunk<T>,
+    end: *mut Chunk<T>,
+    _ph: PhantomData<&'a mut [T]>
+}
 
-impl<'a, T: 'a> Iterator for Items<'a, T> {
+impl<'a, T> Iterator for ChunksMut<'a, T> {
+    type Item = &'a mut [T];
+
+    fn next(&mut self) -> Option<&'a mut [T]> {
+        let chunk = self.start;
+        if chunk.is_null() {
+            None
+        } else {
+            unsafe {
+                if chunk == self.end {
+                    self.start = ptr::null_mut();
+                    self.end = ptr::null_mut()
+                } else {
+                    self.start = (*chunk).next
+                }
+                Some(slice::from_raw_parts_mut((*chunk).items.as_mut_ptr(), (*chunk).len))
+            }
+        }
+    }
+}
+
+unsafe impl <'a, T:Send> Send for ChunksMut<'a, T> {}
+unsafe impl <'a, T:Sync> Sync for ChunksMut<'a, T> {}
+
+impl<'a, T> DoubleEndedIterator for ChunksMut<'a, T> {
+    fn next_back(&mut self) -> Option<&'a mut [T]> {
+        let chunk = self.end;
+        if chunk.is_null() {
+            None
+        } else {
+            unsafe {
+                if chunk == self.start {
+                    self.start = ptr::null_mut();
+                    self.end = ptr::null_mut()
+                } else {
+                    self.end = (*chunk).prev
+                }
+                Some(slice::from_raw_parts_mut((*chunk).items.as_mut_ptr(), (*chunk).len))
+            }
+        }
+    }
+}
+
+// Wrapper to hide ugly adapter type
+pub struct Iter<'a, T: 'a>(iter::FlatMap<Chunks<'a, T>, &'a [T], fn(&'a [T]) -> &'a [T]>);
+
+impl<'a, T: 'a> Iterator for Iter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
         self.0.next()
     }
 }
 
-impl<'a, T: 'a> DoubleEndedIterator for Items<'a, T> {
+impl<'a, T: 'a> DoubleEndedIterator for Iter<'a, T> {
     fn next_back(&mut self) -> Option<&'a T> {
         self.0.next_back()
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for MonoVec<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut need_comma = false;
-        try!(write!(f, "["));
-        for elem in self {
-            if need_comma {
-                try!(write!(f, ", "));
+// Wrapper to hide ugly adapter type
+pub struct IterMut<'a, T: 'a>(iter::FlatMap<ChunksMut<'a, T>, &'a mut [T],
+                              fn(&'a mut [T]) -> &'a mut [T]>);
+
+impl<'a, T: 'a> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+    fn next(&mut self) -> Option<&'a mut T> {
+        self.0.next()
+    }
+}
+
+impl<'a, T: 'a> DoubleEndedIterator for IterMut<'a, T> {
+    fn next_back(&mut self) -> Option<&'a mut T> {
+        self.0.next_back()
+    }
+}
+
+pub struct IntoIter<T> {
+    start: *mut Chunk<T>,
+    end: *mut Chunk<T>,
+    front: *mut T,
+    _ph: PhantomData<T>
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        loop {
+            unsafe {
+                let chunk = self.start;
+                let back = (*chunk).items.as_mut_ptr().offset((*chunk).len as isize);
+                if self.front == back {
+                    if self.start == self.end {
+                        return None
+                    }
+                    self.start = (*chunk).next;
+                    heap::deallocate(chunk as *mut u8,
+                                     mem::size_of::<Chunk<T>>() + (*chunk).cap * mem::size_of::<T>(),
+                                     mem::min_align_of::<Chunk<T>>());
+                    self.front = (*self.start).items.as_mut_ptr();
+                    continue;
+                }
+                let ptr = self.front;
+                self.front = self.front.offset(1);
+                
+                return Some(ptr::read(ptr))
             }
-            try!(elem.fmt(f));
-            need_comma = true;
         }
-        write!(f, "]")
+    }
+}
+
+unsafe impl <T: Send> Send for IntoIter<T> {}
+unsafe impl <T: Sync> Sync for IntoIter<T> {}
+
+impl<T> DoubleEndedIterator for IntoIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        loop {
+            unsafe {
+                let chunk = self.end;
+                let back = (*chunk).items.as_mut_ptr().offset((*chunk).len as isize);
+                if back == self.front {
+                    if chunk == self.start {
+                        return None
+                    }
+                    self.end = (*chunk).prev;
+                    heap::deallocate(
+                        chunk as *mut u8,
+                        mem::size_of::<Chunk<T>>() + (*chunk).cap * mem::size_of::<T>(),
+                        mem::min_align_of::<Chunk<T>>());
+                    continue;
+                }
+                (*chunk).len -= 1;
+                let ptr = (*chunk).items.as_mut_ptr().offset((*chunk).len as isize);
+                return Some(ptr::read(ptr))
+            }
+        }
+    }
+}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        while let Some(_) = self.next() {}
+        debug_assert!(self.start == self.end);
+        unsafe {
+            heap::deallocate(self.start as *mut u8,
+                             mem::size_of::<Chunk<T>>() + (*self.start).cap * mem::size_of::<T>(),
+                             mem::min_align_of::<Chunk<T>>());
+        }
     }
 }
