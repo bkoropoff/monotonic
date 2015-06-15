@@ -36,11 +36,11 @@ impl<T> Chunk<T> {
     fn array_size(len: usize) -> usize {
         len.checked_mul(mem::size_of::<T>()).unwrap()
     }
-    
+
     fn mem_size(len: usize) -> usize {
         mem::size_of::<Self>().checked_add(Self::array_size(len)).unwrap()
     }
-    
+
     fn new(cap: usize) -> *mut Self {
         unsafe {
             let res = heap::allocate(Self::mem_size(cap),
@@ -61,7 +61,7 @@ impl<T> Chain<T> {
     pub fn new() -> Self {
         Self::with_capacity(8)
     }
-    
+
     pub fn with_capacity(cap: usize) -> Self {
         let head = Chunk::new(cmp::max(cap, 1));
         Chain {
@@ -99,7 +99,7 @@ impl<T> Chain<T> {
                     new_cap = new_cap.checked_mul(2).unwrap();
                 }
                 let new = Chunk::new(new_cap);
-                
+
                 (*new).prev = tail;
                 (*tail).next = new;
                 self.tail.set(new);
@@ -152,17 +152,18 @@ impl<T> Chain<T> {
             slice::from_raw_parts(ptr, len)
         }
     }
-    
+
     pub fn clear(&mut self) {
         unsafe {
             loop {
                 let chunk = self.head.get();
                 self.head.set((*chunk).next);
                 if intrinsics::needs_drop::<T>() {
-                    let ptr = (*chunk).items.as_mut_ptr();
+                    let mut ptr = (*chunk).items.as_mut_ptr();
                     let end = ptr.offset((*chunk).len as isize);
                     while ptr < end {
                         intrinsics::drop_in_place(ptr);
+                        ptr = ptr.offset(mem::size_of::<T>() as isize);
                     }
                 }
                 if chunk == self.tail.get() {
@@ -185,7 +186,7 @@ impl<T> Chain<T> {
             _ph: PhantomData
         }
     }
-    
+
     pub fn chunks_mut(&mut self) -> ChunksMut<T> {
         ChunksMut {
             start: self.head.get(),
@@ -448,7 +449,7 @@ impl<T> Iterator for IntoIter<T> {
                 }
                 let ptr = self.front;
                 self.front = self.front.offset(1);
-                
+
                 return Some(ptr::read(ptr))
             }
         }
@@ -492,5 +493,42 @@ impl<T> Drop for IntoIter<T> {
                              mem::size_of::<Chunk<T>>() + (*self.start).cap * mem::size_of::<T>(),
                              mem::min_align_of::<Chunk<T>>());
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn drop_type() {
+        static mut COUNT : usize = 0;
+
+        struct DropType;
+
+        impl DropType {
+            fn new() -> DropType {
+                unsafe { COUNT += 1; }
+                DropType
+            }
+        }
+
+        impl Drop for DropType {
+            fn drop(&mut self) {
+                unsafe { COUNT -= 1 }
+            }
+        }
+
+        {
+            let chain = Chain::new();
+
+            chain.push(DropType::new());
+            chain.push(DropType::new());
+            chain.push(DropType::new());
+
+            assert_eq!(unsafe { COUNT }, 3);
+        }
+
+        assert_eq!(unsafe { COUNT }, 0);
     }
 }
